@@ -25,6 +25,13 @@
 #   - The log only shows counts, e.g. "Live check: 2 leg(s), 0 issue(s)".
 #   - Details only go into the Slack message, which only you receive.
 #
+# Known warnings: the Friday outlook saves the disruption messages it reported
+# for next week in state/known_alerts.json, and the live checks don't repeat
+# those. A new message found by a live check is sent once and then added to the
+# same list. Delays and cancellations are always reported. The file only holds
+# keyed hashes (HMAC-SHA256, with your TRANSPORT_CONFIG as the key), so it
+# can't be linked to Entur's messages, stops or lines, even in a public repo.
+#
 # Needs: TRANSPORT_CONFIG and SLACK_WEBHOOK_URL (GitHub secrets), MODE.
 # =============================================================================
 
@@ -40,6 +47,7 @@ suppressPackageStartupMessages({
   library(dplyr)
   library(lubridate)
   library(purrr)
+  library(openssl)
 })
 
 # "a %||% b" returns a, unless a is missing (NULL or empty), then it returns b.
@@ -64,6 +72,7 @@ cfg <- tryCatch(fromJSON(cfg_text, simplifyVector = FALSE),
 #   notify_when_ok       - live check: also send a message when everything is fine
 #   min_share_of_normal  - outlook: flag a day with fewer departures than this share of normal
 #   noon                 - live check: runs before this time check "morning" trips, after it "evening" trips
+#   repeat_new_warnings  - live check: repeat a new warning in every check (default false: send it once)
 CLIENT      <- cfg$client_name %||% "private-commutecheck"
 DELAY_MIN   <- as.numeric(cfg$delay_minutes %||% 5)
 LIVE_WINDOW <- as.numeric(cfg$live_window_minutes %||% 30)
@@ -71,6 +80,7 @@ NOTIFY_OK   <- isTRUE(cfg$notify_when_ok)
 MIN_SHARE   <- as.numeric(cfg$min_share_of_normal %||% 0.8)
 NOON        <- cfg$noon %||% "12:00"
 TRIPS       <- cfg$trips %||% list()
+REPEAT_NEW  <- isTRUE(cfg$repeat_new_warnings)
 WEBHOOK     <- Sys.getenv("SLACK_WEBHOOK_URL")
 if (!length(TRIPS)) stop("TRANSPORT_CONFIG has no trips.", call. = FALSE)
 
@@ -164,6 +174,10 @@ keeps_call <- function(cl, leg) {
   }
 
   dest <- tolower(unlist(leg$destination_contains))
+  # Ignore empty entries, so "destination_contains": [""] or [" "] means
+  # "no destination filter", the same as leaving the setting out.
+  dest <- trimws(dest)
+  dest <- dest[!is.na(dest) & nzchar(dest)]
   if (length(dest)) {
     d <- tolower(cl$destinationDisplay$frontText %||% "")
     if (!any(map_lgl(dest, function(w) grepl(w, d, fixed = TRUE)))) return(FALSE)
@@ -174,7 +188,7 @@ keeps_call <- function(cl, leg) {
 # ---- Entur ------------------------------------------------------------------
 
 # The fields fetched for each disruption message ("situation").
-SIT_FIELDS <- "situations { summary { value language } description { value language }
+SIT_FIELDS <- "situations { situationNumber summary { value language } description { value language }
                validityPeriod { startTime endTime } }"
 
 # entur_calls(): fetch all departures from a leg's stop between `start` and
@@ -216,7 +230,9 @@ entur_calls <- function(leg, start, range_sec) {
 }
 
 # situation_texts(): turn disruption messages into short, unique texts, keeping
-# only those valid at some point between `from` and `to`.
+# only those valid at some point between `from` and `to`. Each text is named by
+# a key identifying the message: Entur's situation number when there is one
+# (stays the same if Entur edits the wording), otherwise the text itself.
 situation_texts <- function(sits, from, to) {
   if (!length(sits)) return(character())
   valid <- keep(sits, function(s) {
@@ -224,13 +240,17 @@ situation_texts <- function(sits, from, to) {
     en <- if (!is.null(s$validityPeriod$endTime)) ymd_hms(s$validityPeriod$endTime, tz = TZ, quiet = TRUE) else NA
     (is.na(st) || st <= to) && (is.na(en) || en >= from)
   })
+  if (!length(valid)) return(character())
   txt <- map_chr(valid, function(s) {
     sm <- pick_text(s$summary)
     ds <- pick_text(s$description)
     out <- if (nzchar(ds) && ds != sm) paste0(sm, ": ", ds) else sm
     if (nchar(out) > 300) paste0(substr(out, 1, 297), "...") else out
   })
-  unique(txt[nzchar(txt)])
+  keys <- map_chr(valid, function(s) s$situationNumber %||% "")
+  names(txt) <- ifelse(nzchar(keys), keys, txt)
+  txt <- txt[nzchar(txt)]
+  txt[!duplicated(names(txt))]
 }
 
 # leg_data(): departures and messages for one leg between two times.
@@ -270,6 +290,42 @@ leg_data <- function(leg, start, end) {
        n_cancelled = sum(df$cancelled))
 }
 
+# ---- Known warnings (saved between runs) --------------------------------------
+
+# Where the known warnings are saved. The workflow commits this file back to
+# the repository after each run.
+KNOWN_FILE <- file.path("state", "known_alerts.json")
+
+# week_key(): the ISO week a date belongs to, e.g. "2026-W42".
+week_key <- function(date) format(as_date(date), "%G-W%V")
+
+# alert_hash(): a keyed hash of a warning's key. Without your TRANSPORT_CONFIG
+# (a secret), nobody can tell which Entur message a hash belongs to.
+alert_hash <- function(keys) {
+  if (!length(keys)) return(character())
+  as.character(sha256(enc2utf8(keys), key = cfg_text))
+}
+
+# load_known() / save_known(): read and write the file as a list of weeks,
+# each holding the hashes of the warnings already reported for that week.
+# Only the current and coming weeks are kept, so the file stays small.
+load_known <- function() {
+  if (!file.exists(KNOWN_FILE)) return(list())
+  tryCatch(fromJSON(KNOWN_FILE, simplifyVector = FALSE), error = function(e) list())
+}
+save_known <- function(known) {
+  keep_weeks <- week_key(TODAY + days(c(-7, 0, 7)))
+  known <- known[names(known) %in% keep_weeks]
+  dir.create(dirname(KNOWN_FILE), showWarnings = FALSE, recursive = TRUE)
+  writeLines(toJSON(lapply(known, function(x) I(unique(unlist(x)))), auto_unbox = TRUE), KNOWN_FILE)
+}
+
+# add_known(): add hashes to a week in the known list.
+add_known <- function(known, week, hashes) {
+  known[[week]] <- unique(c(unlist(known[[week]]), hashes))
+  known
+}
+
 # ---- Slack ------------------------------------------------------------------
 
 # send_slack(): post a message to your Slack channel through the webhook.
@@ -305,6 +361,12 @@ run_live <- function() {
     return(invisible())
   }
 
+  known      <- load_known()
+  this_week  <- week_key(TODAY)
+  known_week <- unlist(known[[this_week]])
+  n_known    <- 0
+  new_hashes <- character()
+
   parts  <- character()
   issues <- 0
   n_legs_checked <- 0
@@ -335,8 +397,16 @@ run_live <- function() {
         lines_out <- c(lines_out, paste0(":hourglass: Delayed: ",
           paste0(hm_text(delayed$aimed), " (", delayed$line, ", +", mins, " min)", collapse = ", ")))
       }
+      # Disruption messages: leave out those already reported (in Friday's
+      # outlook, or earlier this week), and remember the new ones.
       if (length(td$situations) > 0) {
-        lines_out <- c(lines_out, paste0(":warning: ", td$situations))
+        h       <- alert_hash(names(td$situations))
+        is_new  <- !(h %in% known_week) & !(h %in% new_hashes)
+        n_known <- n_known + sum(!is_new)
+        if (any(is_new)) {
+          lines_out  <- c(lines_out, paste0(":warning: *New:* ", td$situations[is_new]))
+          new_hashes <- c(new_hashes, h[is_new])
+        }
       }
 
       issues <- issues + length(lines_out)
@@ -348,9 +418,16 @@ run_live <- function() {
     }
   }
 
-  message(sprintf("Live check: %d leg(s) checked, %d issue(s) found.", n_legs_checked, issues))
+  message(sprintf("Live check: %d leg(s) checked, %d issue(s) found, %d known warning(s) left out.",
+                  n_legs_checked, issues, n_known))
   if (length(parts)) {
     send_slack(paste0(":bus: *Commute check ", hm_text(NOW), "*\n\n", paste(parts, collapse = "\n\n")))
+  }
+
+  # Save new warnings as known for the rest of the week (unless they should
+  # be repeated), only after the Slack message was sent.
+  if (length(new_hashes) && !REPEAT_NEW) {
+    save_known(add_known(known, this_week, new_hashes))
   }
 }
 
@@ -398,6 +475,7 @@ run_outlook <- function() {
   parts   <- character()
   issues  <- 0
   n_legs_checked <- 0
+  sit_keys <- character()   # keys of all warnings reported for next week
 
   for (tr in checked) {
     win  <- tr$outlook
@@ -431,6 +509,7 @@ run_outlook <- function() {
         for (s in td$situations) {
           sit_days[[s]] <- c(sit_days[[s]], format(date0, "%a"))
         }
+        sit_keys <- c(sit_keys, names(td$situations))
       }
 
       sit_lines <- if (length(sit_days)) {
@@ -450,6 +529,13 @@ run_outlook <- function() {
   message(sprintf("Outlook: %d leg(s) checked for week %d, %d issue(s) found.", n_legs_checked, week_no, issues))
   if (length(parts)) {
     send_slack(paste0(":calendar: *Commute outlook for week ", week_no, "*\n\n", paste(parts, collapse = "\n\n")))
+  }
+
+  # Save the reported warnings as known for next week, so the live checks
+  # next week don't repeat them. Only after the Slack message was sent.
+  if (length(sit_keys)) {
+    known <- load_known()
+    save_known(add_known(known, week_key(next_monday), alert_hash(unique(sit_keys))))
   }
 }
 
