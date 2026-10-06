@@ -81,6 +81,13 @@ MIN_SHARE   <- as.numeric(cfg$min_share_of_normal %||% 0.8)
 NOON        <- cfg$noon %||% "12:00"
 TRIPS       <- cfg$trips %||% list()
 REPEAT_NEW  <- isTRUE(cfg$repeat_new_warnings)
+
+# Live hours: scheduled live checks only run inside these windows. GitHub
+# sometimes starts scheduled runs hours late; a late run outside the windows is
+# skipped instead of sending alerts for the wrong time of day. Manual runs (the
+# Run workflow button) always run. Set "live_hours" in your settings to change.
+LIVE_HOURS  <- cfg$live_hours %||% list(list("07:00", "09:15"), list("16:00", "18:15"))
+EVENT       <- Sys.getenv("GITHUB_EVENT_NAME", "manual")
 WEBHOOK     <- Sys.getenv("SLACK_WEBHOOK_URL")
 if (!length(TRIPS)) stop("TRANSPORT_CONFIG has no trips.", call. = FALSE)
 
@@ -351,7 +358,17 @@ send_slack <- function(text) {
 #      disruption messages, and a warning if no departures were found.
 #   4. Send a Slack message only if something was found (or always, if
 #      notify_when_ok is true). The log only shows counts.
+# Scheduled runs that start outside LIVE_HOURS (because GitHub started them
+# late) are skipped; manual runs always go ahead.
 run_live <- function() {
+  in_hours <- any(map_lgl(LIVE_HOURS, function(w) {
+    NOW >= at_time(TODAY, w[[1]]) && NOW <= at_time(TODAY, w[[2]])
+  }))
+  if (EVENT == "schedule" && !in_hours) {
+    message("Live check: started outside the live hours (a delayed scheduled run); skipped.")
+    return(invisible())
+  }
+
   part <- if (NOW < at_time(TODAY, NOON)) "morning" else "evening"
   due  <- keep(TRIPS, function(tr) {
     identical(tolower(tr$part %||% ""), part) && WDAY %in% trip_days(tr)
