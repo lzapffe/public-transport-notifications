@@ -1,10 +1,13 @@
 # =============================================================================
-# Commute alerts: runs transport_alerts.R on a schedule.
-#   - Fridays 11:00: the outlook for next week.
+# Commute alerts: runs transport_alerts.R when started from outside.
+#   The timing is done by the Google Apps Script "central scheduler" (personal
+#   Google account), which starts this workflow through GitHub's API:
+#   - Fridays 11:00: the outlook for next week (mode = outlook).
 #   - Weekdays 07:15-08:45 and 16:15-17:45, every 30 minutes: live checks of
-#     the next 30 minutes.
-#   - The 1st of each month: a "keepalive" step, since GitHub turns off
-#     schedules in public repositories after 60 days without activity.
+#     the next 30 minutes (mode = live).
+#   GitHub's own schedules were removed because they started hours late or not
+#   at all. Without schedules, no keepalive is needed: the 60-day rule only
+#   turns off schedules, not workflows started through the API.
 # Your stops, lines and directions are NOT in this file or the script: they're
 # in the TRANSPORT_CONFIG secret. This repository is public, and so are its
 # Actions logs, so the script only ever logs counts. The known-warnings file it
@@ -14,25 +17,8 @@
 name: Commute alerts
 
 on:
-  schedule:
-    # Friday outlook for next week, 11:00 Oslo time. If you change this time,
-    # change it in the two "if:" lines and the MODE line below too.
-    - cron: "0 11 * * 5"
-      timezone: "Europe/Oslo"
-
-    # Morning live checks, Monday-Friday: 07:15, 07:45, 08:15, 08:45.
-    - cron: "15,45 7,8 * * 1-5"
-      timezone: "Europe/Oslo"
-
-    # Evening live checks, Monday-Friday: 16:15, 16:45, 17:15, 17:45.
-    - cron: "15,45 16,17 * * 1-5"
-      timezone: "Europe/Oslo"
-
-    # Keepalive, the 1st of each month at 12:00.
-    - cron: "0 12 1 * *"
-      timezone: "Europe/Oslo"
-
-  # Adds a "Run workflow" button for testing, with a choice of check.
+  # Started by the scheduler (or by hand with the "Run workflow" button), with
+  # a choice of check.
   workflow_dispatch:
     inputs:
       mode:
@@ -51,9 +37,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ---- The commute check (every schedule except the keepalive) ----
+  # ---- The commute check ----
   check:
-    if: github.event.schedule != '0 12 1 * *'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Needs write access to save the known-warnings file (hashes only).
@@ -79,14 +64,14 @@ jobs:
             any::purrr
             any::openssl
 
-      # Run the check. MODE is "outlook" for the Friday 11:00 schedule (or when
-      # chosen with the Run workflow button), otherwise "live". The settings and
+      # Run the check. MODE comes from the scheduler (or the Run workflow
+      # button): "outlook" or "live" (the default). The settings and
       # the Slack address come from the repository's secrets: GitHub never
       # shows them in the log, and they're not available to copies (forks) of
       # this repository.
       - name: Run commute check
         env:
-          MODE: ${{ inputs.mode || (github.event.schedule == '0 11 * * 5' && 'outlook' || 'live') }}
+          MODE: ${{ inputs.mode || 'live' }}
           TRANSPORT_CONFIG: ${{ secrets.TRANSPORT_CONFIG }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: Rscript transport_alerts.R
@@ -108,23 +93,3 @@ jobs:
               git push
             fi
           fi
-
-  # ---- Keepalive (1st of each month) ----
-  # GitHub disables scheduled workflows in public repositories after 60 days
-  # without repository activity. This step re-enables (confirms) the workflow
-  # through GitHub's API, which keeps it active without needing commits.
-  keepalive:
-    if: github.event.schedule == '0 12 1 * *'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-    steps:
-      - name: Keep the schedule active
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          curl -fsS -X PUT \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/commute-alerts.yml/enable" \
-            && echo "Workflow confirmed active."
