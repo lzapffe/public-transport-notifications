@@ -13,6 +13,12 @@
 #                 next 30 minutes for cancellations, delays and active
 #                 disruption messages.
 #
+#   Stretch times (live check): for legs with "sections", e.g. your stop to the
+#                 end of the usual queue, and your stop to where you get off,
+#                 the time the most recent bus actually took over each stretch,
+#                 compared with the timetable. Reported when a stretch is 5+
+#                 minutes slow, then again only when it changes by 5+ minutes.
+#
 # A trip can have several legs (e.g. a bus to a hub, then a metro from the
 # hub). Each leg has its own boarding stop, lines (by mode and number, e.g.
 # "bus 31", "metro 2") and direction, plus an offset in minutes for when you
@@ -81,6 +87,14 @@ MIN_SHARE   <- as.numeric(cfg$min_share_of_normal %||% 0.8)
 NOON        <- cfg$noon %||% "12:00"
 TRIPS       <- cfg$trips %||% list()
 REPEAT_NEW  <- isTRUE(cfg$repeat_new_warnings)
+
+# Bus stretch times (live check, for legs with "sections"):
+#   section_delay_minutes    - report when the last bus over a stretch took at least this much longer than the timetable (default 5)
+#   section_change_minutes   - after that, report again only when a stretch changed by at least this much (default 5)
+#   section_lookback_minutes - how far back to look for buses that have finished a stretch (default 90)
+SECTION_DELAY    <- as.numeric(cfg$section_delay_minutes %||% 5)
+SECTION_CHANGE   <- as.numeric(cfg$section_change_minutes %||% 5)
+SECTION_LOOKBACK <- as.numeric(cfg$section_lookback_minutes %||% 90)
 
 # Live hours: scheduled live checks only run inside these windows. GitHub
 # sometimes starts scheduled runs hours late; a late run outside the windows is
@@ -333,6 +347,179 @@ add_known <- function(known, week, hashes) {
   known
 }
 
+# ---- Bus stretch times (how long the last bus took) ---------------------------
+#
+# A leg can have "sections": stretches of the route, e.g. from your stop to
+# the end of the usual queue, and from your stop to where you get off. For
+# each section, the live check finds the most recent bus on your line that has
+# already driven the whole stretch, and compares its actual travel time with
+# the timetable. The difference ("extra minutes") estimates how slow the
+# stretch is right now.
+
+# section_calls(): the buses on a leg's lines and direction that left `from`
+# in the last SECTION_LOOKBACK minutes, each with all the stops of its journey
+# today (timetable, expected and actual times). The stop ID is sent to Entur
+# in the request body and never printed.
+section_calls <- function(leg, from) {
+  root  <- if (startsWith(from, "NSR:Quay:")) "quay" else "stopPlace"
+  query <- sprintf(
+    'query($id: String!, $start: DateTime!, $range: Int!, $date: Date!) {
+       place: %s(id: $id) {
+         estimatedCalls(startTime: $start, timeRange: $range, numberOfDepartures: 200,
+                        includeCancelledTrips: true) {
+           cancellation
+           destinationDisplay { frontText }
+           serviceJourney {
+             line { id publicCode transportMode }
+             estimatedCalls(date: $date) {
+               quay { id stopPlace { id } }
+               aimedArrivalTime aimedDepartureTime
+               expectedArrivalTime expectedDepartureTime
+               actualArrivalTime actualDepartureTime
+               cancellation
+             }
+           }
+         }
+       }
+     }',
+    root
+  )
+  vars <- list(id = from, start = iso_time(NOW - minutes(SECTION_LOOKBACK)),
+               range = as.integer(SECTION_LOOKBACK * 60), date = format(TODAY))
+
+  resp <- request("https://api.entur.io/journey-planner/v3/graphql") |>
+    req_headers("ET-Client-Name" = CLIENT) |>
+    req_body_json(list(query = query, variables = vars), auto_unbox = TRUE) |>
+    req_retry(max_tries = 3) |>
+    req_error(is_error = function(r) FALSE) |>
+    req_perform()
+  if (resp_status(resp) >= 400) stop("Entur returned HTTP ", resp_status(resp), " for a section.", call. = FALSE)
+  j <- resp_body_json(resp)
+  if (!is.null(j$errors)) stop("Entur returned an error for a section.", call. = FALSE)
+  if (is.null(j$data$place)) stop("A section stop ID in TRANSPORT_CONFIG was not found by Entur.", call. = FALSE)
+
+  # Keep only your lines and direction, and skip cancelled buses.
+  keep(j$data$place$estimatedCalls %||% list(),
+       function(cl) keeps_call(cl, leg) && !isTRUE(cl$cancellation))
+}
+
+# at_stop(): TRUE if a journey's stop is the given stop. The ID can be a whole
+# stop (NSR:StopPlace) or one platform (NSR:Quay).
+at_stop <- function(call, id) {
+  identical(call$quay$id, id) || identical(call$quay$stopPlace$id, id)
+}
+
+# passed_time(): when the bus actually left (or arrived at) a stop, or NA if
+# it hasn't passed yet. Uses Entur's recorded ("actual") time; if that's
+# missing, the expected time is used, but only once it's in the past.
+passed_time <- function(call, which = c("departure", "arrival")) {
+  which  <- match.arg(which)
+  fields <- if (which == "departure") {
+    c("actualDepartureTime", "actualArrivalTime", "expectedDepartureTime")
+  } else {
+    c("actualArrivalTime", "actualDepartureTime", "expectedArrivalTime")
+  }
+  for (f in fields) {
+    if (!is.null(call[[f]])) {
+      t <- ymd_hms(call[[f]], tz = TZ, quiet = TRUE)
+      if (is.na(t)) next
+      if (startsWith(f, "expected") && t > NOW) return(NA)
+      return(t)
+    }
+  }
+  NA
+}
+
+# journey_section(): for one bus journey, the stretch from `from` to `to`:
+# when the bus left `from`, its actual travel time, and its extra minutes
+# compared with the timetable. NULL if the bus hasn't finished the stretch.
+journey_section <- function(stops, from, to) {
+  i <- which(map_lgl(stops, at_stop, id = from))[1]
+  if (is.na(i)) return(NULL)
+  later <- which(map_lgl(stops, at_stop, id = to))
+  k <- later[later > i][1]
+  if (is.na(k)) return(NULL)
+  if (isTRUE(stops[[k]]$cancellation)) return(NULL)
+
+  dep <- passed_time(stops[[i]], "departure")
+  arr <- passed_time(stops[[k]], "arrival")
+  if (is.na(dep) || is.na(arr)) return(NULL)
+
+  aimed_dep <- ymd_hms(stops[[i]]$aimedDepartureTime %||% stops[[i]]$aimedArrivalTime, tz = TZ, quiet = TRUE)
+  aimed_arr <- ymd_hms(stops[[k]]$aimedArrivalTime %||% stops[[k]]$aimedDepartureTime, tz = TZ, quiet = TRUE)
+  actual_min <- as.numeric(difftime(arr, dep, units = "mins"))
+  planned_min <- as.numeric(difftime(aimed_arr, aimed_dep, units = "mins"))
+  list(left = dep, minutes = actual_min, extra = actual_min - planned_min)
+}
+
+# leg_sections(): for each of a leg's sections, the most recent bus (by when it
+# left the section's first stop) that has finished the stretch. Returns one
+# entry per section with its name and either the result or NULL (no bus found).
+leg_sections <- function(leg) {
+  secs <- leg$sections %||% list()
+  if (!length(secs)) return(list())
+  froms <- unique(map_chr(secs, function(s) s$from %||% leg$from))
+  calls_by_from <- setNames(lapply(froms, function(f) section_calls(leg, f)), froms)
+
+  map(secs, function(s) {
+    from <- s$from %||% leg$from
+    done <- compact(map(calls_by_from[[from]], function(cl) {
+      journey_section(cl$serviceJourney$estimatedCalls %||% list(), from, s$to)
+    }))
+    latest <- if (length(done)) done[[which.max(map_dbl(done, function(x) as.numeric(x$left)))]] else NULL
+    list(name = s$name %||% "section", result = latest)
+  })
+}
+
+# Where the last reported stretch times are saved, so the next check knows
+# whether things changed enough to report again. Keyed hashes and minutes
+# only, never stop or section names. Reset for each new morning or evening.
+SECTION_FILE <- file.path("state", "section_alerts.json")
+
+# load_sections() / save_sections(): read and write that file.
+load_sections <- function() {
+  if (!file.exists(SECTION_FILE)) return(list())
+  tryCatch(fromJSON(SECTION_FILE, simplifyVector = FALSE), error = function(e) list())
+}
+save_sections <- function(period, values) {
+  dir.create(dirname(SECTION_FILE), showWarnings = FALSE, recursive = TRUE)
+  writeLines(toJSON(list(period = period, values = as.list(values)), auto_unbox = TRUE), SECTION_FILE)
+}
+
+# section_decision(): whether to report a trip's stretch times now.
+#   - Not yet reported this morning/evening: report if any stretch is at least
+#     SECTION_DELAY minutes slower than the timetable.
+#   - Already reported: report again only if any stretch changed by at least
+#     SECTION_CHANGE minutes (worse or better) since the last report.
+# `extra` and `prev` are named by keyed hashes; NA means no bus data.
+section_decision <- function(extra, prev) {
+  known <- !is.na(extra)
+  if (!any(known)) return(FALSE)
+  had <- names(extra) %in% names(prev)
+  p   <- unlist(prev[names(extra)[had]])
+  new_slow <- known & !had & extra >= SECTION_DELAY
+  changed  <- rep(FALSE, length(extra))
+  changed[had] <- !is.na(extra[had]) & abs(extra[had] - p) >= SECTION_CHANGE
+  any(new_slow | changed)
+}
+
+# section_lines(): the Slack lines for a trip's stretches, e.g.
+#   "Stretch to the queue end: 14 min, +6 vs timetable (bus that left 07:05, last report +12)".
+section_lines <- function(sections, extra, prev) {
+  map_chr(seq_along(sections), function(i) {
+    s <- sections[[i]]
+    if (is.null(s$result)) {
+      return(sprintf(":grey_question: %s: no bus has finished this stretch in the last %d min.",
+                     s$name, as.integer(SECTION_LOOKBACK)))
+    }
+    was <- prev[[names(extra)[i]]]
+    sprintf("%s %s: %d min, %+d vs timetable (bus that left %s%s)",
+            if (extra[i] >= SECTION_DELAY) ":traffic_light:" else ":white_check_mark:",
+            s$name, round(s$result$minutes), round(extra[i]), hm_text(s$result$left),
+            if (!is.null(was)) sprintf(", last report %+d", round(was)) else "")
+  })
+}
+
 # ---- Slack ------------------------------------------------------------------
 
 # send_slack(): post a message to your Slack channel through the webhook.
@@ -384,6 +571,14 @@ run_live <- function() {
   n_known    <- 0
   new_hashes <- character()
 
+  # The stretch times reported earlier this morning/evening (if any).
+  period    <- paste(TODAY, part)
+  sec_state <- load_sections()
+  sec_prev  <- if (identical(sec_state$period, period)) sec_state$values %||% list() else list()
+  sec_save  <- sec_prev
+  n_sections <- 0
+  sec_failed <- 0
+
   parts  <- character()
   issues <- 0
   n_legs_checked <- 0
@@ -426,6 +621,26 @@ run_live <- function() {
         }
       }
 
+      # Stretch times: how long the last bus took over each of the leg's
+      # sections. Added to the message when a stretch is slow, or when it
+      # changed enough since the last report (see section_decision()).
+      if (length(leg$sections)) {
+        secs <- tryCatch(leg_sections(leg), error = function(e) {
+          message("Section check failed: ", conditionMessage(e))
+          sec_failed <<- sec_failed + 1
+          NULL
+        })
+        if (length(secs)) {
+          n_sections <- n_sections + length(secs)
+          keys  <- alert_hash(map_chr(secs, function(x) paste(tr$name %||% "", leg$name %||% "", x$name, sep = "|")))
+          extra <- setNames(map_dbl(secs, function(x) if (is.null(x$result)) NA_real_ else x$result$extra), keys)
+          if (section_decision(extra, sec_prev) || NOTIFY_OK) {
+            lines_out <- c(lines_out, section_lines(secs, extra, sec_prev))
+            for (k in keys[!is.na(extra)]) sec_save[[k]] <- round(extra[[k]], 1)
+          }
+        }
+      }
+
       issues <- issues + length(lines_out)
       if (length(lines_out) > 0 || NOTIFY_OK) {
         header <- sprintf("*%s* (%s-%s)", leg_label(tr, leg, i, length(legs)), hm_text(start), hm_text(end))
@@ -437,9 +652,15 @@ run_live <- function() {
 
   message(sprintf("Live check: %d leg(s) checked, %d issue(s) found, %d known warning(s) left out.",
                   n_legs_checked, issues, n_known))
+  if (n_sections + sec_failed > 0) {
+    message(sprintf("Stretch times: %d section(s) checked, %d leg(s) failed.", n_sections, sec_failed))
+  }
   if (length(parts)) {
     send_slack(paste0(":bus: *Commute check ", hm_text(NOW), "*\n\n", paste(parts, collapse = "\n\n")))
   }
+
+  # Remember the stretch times just reported, only after the message was sent.
+  if (!identical(sec_save, sec_prev)) save_sections(period, unlist(sec_save))
 
   # Save new warnings as known for the rest of the week (unless they should
   # be repeated), only after the Slack message was sent.

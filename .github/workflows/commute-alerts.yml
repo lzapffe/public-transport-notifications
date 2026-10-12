@@ -10,8 +10,9 @@
 #   turns off schedules, not workflows started through the API.
 # Your stops, lines and directions are NOT in this file or the script: they're
 # in the TRANSPORT_CONFIG secret. This repository is public, and so are its
-# Actions logs, so the script only ever logs counts. The known-warnings file it
-# saves (state/known_alerts.json) only contains keyed hashes.
+# Actions logs, so the script only ever logs counts. The state files it
+# saves (state/known_alerts.json, state/section_alerts.json) only contain
+# keyed hashes and minutes.
 # =============================================================================
 
 name: Commute alerts
@@ -76,19 +77,21 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: Rscript transport_alerts.R
 
-      # Save the known-warnings file back to the repository, so the next run
-      # knows which warnings you've already been told about. The file only
-      # contains keyed hashes, never the warnings, stops or lines. Runs even if
-      # the check failed, and only commits when the file actually changed.
-      - name: Save known warnings
+      # Save the state files back to the repository, so the next run knows
+      # which warnings you've already been told about (known_alerts.json) and
+      # which bus stretch times were last reported (section_alerts.json). The
+      # files only contain keyed hashes and minutes, never the warnings, stops
+      # or lines. Runs even if the check failed, and only commits when a file
+      # actually changed.
+      - name: Save state
         if: always()
         run: |
-          if [ -f state/known_alerts.json ]; then
+          if [ -d state ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898183+github-actions[bot]@users.noreply.github.com"
-            git add state/known_alerts.json
+            git add state/
             if ! git diff --cached --quiet; then
-              git commit -m "Update known warnings"
+              git commit -m "Update known warnings and stretch times"
               git pull --rebase
               git push
             fi

@@ -92,3 +92,93 @@ for (tr in cfg$trips) {
     cat("  After the destination filter (", paste(dest, collapse = ", "), "):", length(step2), "\n")
   }
 }
+
+# =============================================================================
+# Stretch times ("sections"): for each leg with sections, show the last buses
+# that left the leg's stop in the past 90 minutes, and for each section how
+# long they took compared with the timetable. "actual" means Entur has a
+# recorded time; "expected" means only a prediction was available.
+# =============================================================================
+
+# Fetch the last 90 minutes of buses from a stop, with every stop of each
+# bus's journey today (timetable, expected and actual times).
+fetch_past <- function(from) {
+  root  <- if (startsWith(from, "NSR:Quay:")) "quay" else "stopPlace"
+  query <- sprintf('query($id: String!, $start: DateTime!, $date: Date!) {
+    place: %s(id: $id) {
+      name
+      estimatedCalls(startTime: $start, timeRange: 5400, numberOfDepartures: 200, includeCancelledTrips: true) {
+        cancellation
+        destinationDisplay { frontText }
+        serviceJourney {
+          line { id publicCode transportMode }
+          estimatedCalls(date: $date) {
+            quay { id name stopPlace { id } }
+            aimedArrivalTime aimedDepartureTime expectedArrivalTime expectedDepartureTime
+            actualArrivalTime actualDepartureTime cancellation
+          }
+        }
+      }
+    }
+  }', root)
+  start <- format(Sys.time() - 90 * 60, "%Y-%m-%dT%H:%M:%S%z")
+  start <- sub("(\\d{2})(\\d{2})$", "\\1:\\2", start)
+  j <- request("https://api.entur.io/journey-planner/v3/graphql") |>
+    req_headers("ET-Client-Name" = cfg$client_name %||% "private-commutecheck") |>
+    req_body_json(list(query = query, variables = list(id = from, start = start, date = format(Sys.Date()))),
+                  auto_unbox = TRUE) |>
+    req_perform() |>
+    resp_body_json()
+  if (!is.null(j$errors)) cat("  Entur error:", j$errors[[1]]$message, "\n")
+  j$data$place
+}
+
+# Is a journey's stop the given stop (whole stop or platform ID)?
+is_stop <- function(cl, id) identical(cl$quay$id, id) || identical(cl$quay$stopPlace$id, id)
+
+# Turn Entur's time text into a time (or NA).
+tm <- function(x) if (is.null(x)) NA else as.POSIXct(sub("([+-]\\d{2}):(\\d{2})$", "\\1\\2", x), format = "%Y-%m-%dT%H:%M:%S%z")
+
+for (tr in cfg$trips) {
+  for (leg in tr$legs %||% list(tr)) {
+    if (!length(leg$sections)) next
+    cat("\n==== Stretch times:", tr$name %||% "Trip", "/", leg$name %||% "leg", "====\n")
+    place <- fetch_past(leg$from)
+    if (is.null(place)) { cat("  Stop ID not found by Entur:", leg$from, "\n"); next }
+    calls <- place$estimatedCalls %||% list()
+    cat("  Stop:", place$name, "-", length(calls), "departures in the last 90 minutes (all lines)\n")
+
+    # Same line filter as above (mode/line only; the destination filter is
+    # skipped here to keep it simple).
+    specs <- map(unlist(leg$lines), parse_line)
+    calls <- keep(calls, function(cl) {
+      ln <- cl$serviceJourney$line; m <- tolower(ln$transportMode %||% ""); code <- toupper(ln$publicCode %||% "")
+      !length(specs) || any(map_lgl(specs, function(sp)
+        (is.null(sp$id) || sp$id == ln$id) && (is.null(sp$mode) || sp$mode == m) &&
+          (is.null(sp$code) || toupper(sp$code) == code)))
+    })
+    cat("  On your line(s):", length(calls), "\n")
+
+    # For each section, show each of the last 6 buses: when it left, how long it
+    # took, the timetable time, and whether the times were recorded or predicted.
+    for (s in leg$sections) {
+      from <- s$from %||% leg$from
+      cat("  -- Section:", s$name %||% "section", "\n")
+      for (cl in tail(calls, 6)) {
+        st <- cl$serviceJourney$estimatedCalls %||% list()
+        i <- which(map_lgl(st, is_stop, id = from))[1]
+        k <- which(map_lgl(st, is_stop, id = s$to)); k <- k[!is.na(i) & k > i][1]
+        if (is.na(i) || is.na(k)) { cat("     bus to", cl$destinationDisplay$frontText, ": stops not found on its route\n"); next }
+        dep <- tm(st[[i]]$actualDepartureTime %||% st[[i]]$expectedDepartureTime)
+        arr <- tm(st[[k]]$actualArrivalTime %||% st[[k]]$expectedArrivalTime)
+        plan <- as.numeric(difftime(tm(st[[k]]$aimedArrivalTime), tm(st[[i]]$aimedDepartureTime), units = "mins"))
+        took <- as.numeric(difftime(arr, dep, units = "mins"))
+        cat(sprintf("     left %s, took %.0f min (timetable %.0f, %+.0f), %s at the start, %s at the end%s\n",
+                    format(dep, "%H:%M"), took, plan, took - plan,
+                    if (is.null(st[[i]]$actualDepartureTime)) "expected" else "actual",
+                    if (is.null(st[[k]]$actualArrivalTime)) "expected" else "actual",
+                    if (isTRUE(arr > Sys.time())) " (not there yet)" else ""))
+      }
+    }
+  }
+}
