@@ -372,7 +372,7 @@ section_calls <- function(leg, from) {
            serviceJourney {
              line { id publicCode transportMode }
              estimatedCalls(date: $date) {
-               quay { id stopPlace { id } }
+               quay { id stopPlace { id parent { id } } }
                aimedArrivalTime aimedDepartureTime
                expectedArrivalTime expectedDepartureTime
                actualArrivalTime actualDepartureTime
@@ -404,9 +404,11 @@ section_calls <- function(leg, from) {
 }
 
 # at_stop(): TRUE if a journey's stop is the given stop. The ID can be a whole
-# stop (NSR:StopPlace) or one platform (NSR:Quay).
+# stop (NSR:StopPlace), one platform (NSR:Quay), or a hub that groups several
+# stops (e.g. a bus terminal and a metro station under one parent ID).
 at_stop <- function(call, id) {
-  identical(call$quay$id, id) || identical(call$quay$stopPlace$id, id)
+  identical(call$quay$id, id) || identical(call$quay$stopPlace$id, id) ||
+    identical(call$quay$stopPlace$parent$id, id)
 }
 
 # passed_time(): when the bus actually left (or arrived at) a stop, or NA if

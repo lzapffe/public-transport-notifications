@@ -15,8 +15,12 @@ library(purrr)
 # "a %||% b" returns a unless it's missing.
 `%||%` <- function(a, b) if (is.null(a) || length(a) == 0) b else a
 
-# Read your settings from the private file (change the path if needed).
-cfg <- fromJSON(paste(readLines("private/commute_config.txt", warn = FALSE), collapse = ""),
+# Your private settings file (the same JSON as the TRANSPORT_CONFIG secret).
+# Change the folder here if the file isn't in the "private" folder.
+CONFIG_FILE <- "private/JSON string for secret in Github.txt"
+
+# Read your settings from that file.
+cfg <- fromJSON(paste(readLines(CONFIG_FILE, warn = FALSE), collapse = ""),
                 simplifyVector = FALSE)
 
 # Same line-setting rules as the main script ("bus 31", "31" or "RUT:Line:31").
@@ -113,7 +117,7 @@ fetch_past <- function(from) {
         serviceJourney {
           line { id publicCode transportMode }
           estimatedCalls(date: $date) {
-            quay { id name stopPlace { id } }
+            quay { id name stopPlace { id name parent { id name } } }
             aimedArrivalTime aimedDepartureTime expectedArrivalTime expectedDepartureTime
             actualArrivalTime actualDepartureTime cancellation
           }
@@ -133,8 +137,9 @@ fetch_past <- function(from) {
   j$data$place
 }
 
-# Is a journey's stop the given stop (whole stop or platform ID)?
-is_stop <- function(cl, id) identical(cl$quay$id, id) || identical(cl$quay$stopPlace$id, id)
+# Is a journey's stop the given stop (whole stop, platform, or a hub's parent ID)?
+is_stop <- function(cl, id) identical(cl$quay$id, id) || identical(cl$quay$stopPlace$id, id) ||
+  identical(cl$quay$stopPlace$parent$id, id)
 
 # Turn Entur's time text into a time (or NA).
 tm <- function(x) if (is.null(x)) NA else as.POSIXct(sub("([+-]\\d{2}):(\\d{2})$", "\\1\\2", x), format = "%Y-%m-%dT%H:%M:%S%z")
@@ -161,6 +166,15 @@ for (tr in cfg$trips) {
 
     # For each section, show each of the last 6 buses: when it left, how long it
     # took, the timetable time, and whether the times were recorded or predicted.
+    # Show the route of the most recent bus: every stop with its IDs, so you
+    # can compare them with the IDs in your settings.
+    if (length(calls)) {
+      st <- calls[[length(calls)]]$serviceJourney$estimatedCalls %||% list()
+      cat("  Route of the most recent bus (", length(st), "stops): stop ID | parent ID | name\n")
+      for (x in st) cat(sprintf("     %s | %s | %s\n", x$quay$stopPlace$id %||% "-",
+                                x$quay$stopPlace$parent$id %||% "-", x$quay$stopPlace$name %||% x$quay$name %||% "?"))
+    }
+
     for (s in leg$sections) {
       from <- s$from %||% leg$from
       cat("  -- Section:", s$name %||% "section", "\n")
@@ -168,7 +182,19 @@ for (tr in cfg$trips) {
         st <- cl$serviceJourney$estimatedCalls %||% list()
         i <- which(map_lgl(st, is_stop, id = from))[1]
         k <- which(map_lgl(st, is_stop, id = s$to)); k <- k[!is.na(i) & k > i][1]
-        if (is.na(i) || is.na(k)) { cat("     bus to", cl$destinationDisplay$frontText, ": stops not found on its route\n"); next }
+        # A bus where the end comes before the start is going the other way
+        # (this debug script doesn't use the destination filter); the main
+        # script simply ignores those.
+        if (!is.na(i) && is.na(k) && any(map_lgl(st, is_stop, id = s$to))) {
+          cat("     bus to", cl$destinationDisplay$frontText, ": other direction, ignored\n")
+          next
+        }
+        if (is.na(i) || is.na(k)) {
+          cat("     bus to", cl$destinationDisplay$frontText, ": stops not found on its route (",
+              length(st), "stops in the journey; start", if (is.na(i)) "NOT found" else "found",
+              "; end", if (any(map_lgl(st, is_stop, id = s$to))) "found, but not after the start" else "NOT found", ")\n")
+          next
+        }
         dep <- tm(st[[i]]$actualDepartureTime %||% st[[i]]$expectedDepartureTime)
         arr <- tm(st[[k]]$actualArrivalTime %||% st[[k]]$expectedArrivalTime)
         plan <- as.numeric(difftime(tm(st[[k]]$aimedArrivalTime), tm(st[[i]]$aimedDepartureTime), units = "mins"))
